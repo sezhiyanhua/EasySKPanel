@@ -4,6 +4,10 @@ EasySKPanel is a Blender Python script that creates bone sliders for controlling
 
 The script lets you choose which shape keys to expose, creates or updates an armature-based slider panel, and preserves existing drivers that were not created by EasySKPanel.
 
+## Compatibility
+
+Tested and confirmed working with Blender 3.6 and Blender 5.2.
+
 ## Requirements
 
 - Blender with Python scripting support
