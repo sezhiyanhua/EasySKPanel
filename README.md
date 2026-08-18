@@ -36,6 +36,7 @@ Run the script again with the source mesh or its generated EmjPanel selected to 
 
 SZ
 
+- [GitHub](https://github.com/sezhiyanhua)
 - [Bilibili](https://space.bilibili.com/12379590)
 
 ## License
