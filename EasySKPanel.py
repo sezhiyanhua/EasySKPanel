@@ -2,12 +2,15 @@
 Author: SZ
 bilibili: https://space.bilibili.com/12379590
 
-Create bone sliders that control an object's shape keys in Blender.
+Create bone sliders that control selected mesh objects' shape keys in Blender.
+Shape keys with the same name share one slider across all selected meshes.
 Run the script in Object Mode, select the shape keys to control, and rerun it
 to update or remove the generated panel.
 
 Existing drivers not created by EmjPanel are preserved.
 """
+
+import json
 
 import bpy
 from bpy.props import BoolProperty, CollectionProperty, StringProperty
@@ -42,35 +45,58 @@ def _find_panel_armature(target):
     for obj in bpy.data.objects:
         if obj.type != "ARMATURE":
             continue
-        if obj.get("shape_key_slider_target") == target.name:
+        if target.name in _panel_target_names(obj):
             return obj
     return None
 
 
-def _target_from_panel(panel):
-    target_name = panel.get("shape_key_slider_target")
-    return bpy.data.objects.get(target_name) if target_name else None
+def _panel_target_names(panel):
+    stored_names = panel.get("shape_key_slider_targets")
+    if stored_names:
+        try:
+            names = json.loads(stored_names)
+            if isinstance(names, list):
+                return [name for name in names if isinstance(name, str)]
+        except (TypeError, ValueError):
+            pass
+    legacy_name = panel.get("shape_key_slider_target")
+    return [legacy_name] if legacy_name else []
 
 
-def _create_panel_armature(target):
+def _targets_from_panel(panel):
+    return [
+        target
+        for name in _panel_target_names(panel)
+        if (target := bpy.data.objects.get(name)) is not None
+    ]
+
+
+def _store_panel_targets(panel, targets):
+    names = [target.name for target in targets]
+    panel["shape_key_slider_targets"] = json.dumps(names, ensure_ascii=False)
+    # Keep the original property for compatibility with older script versions.
+    panel["shape_key_slider_target"] = names[0]
+
+
+def _create_panel_armature(target, targets):
     panel_name = target.name + PANEL_SUFFIX
     armature_data = bpy.data.armatures.new(panel_name)
     panel = bpy.data.objects.new(panel_name, armature_data)
     bpy.context.collection.objects.link(panel)
 
     panel.matrix_world = target.matrix_world.copy()
-    panel["shape_key_slider_target"] = target.name
+    _store_panel_targets(panel, targets)
     panel.show_in_front = True
     armature_data.display_type = "BBONE"
     armature_data.show_names = True
     return panel
 
 
-def _rename_panel(panel, target):
+def _rename_panel(panel, target, targets):
     panel_name = target.name + PANEL_SUFFIX
     panel.name = panel_name
     panel.data.name = panel_name
-    panel["shape_key_slider_target"] = target.name
+    _store_panel_targets(panel, targets)
 
 
 def _activate_object(obj):
@@ -290,6 +316,162 @@ def _value_driver(key_data, shape_key):
     )
 
 
+def _value_action_fcurve(key_data, shape_key):
+    animation_data = key_data.animation_data
+    action = animation_data.action if animation_data is not None else None
+    if action is None:
+        return None
+    data_path = shape_key.path_from_id("value")
+    return next(
+        (fcurve for fcurve in action.fcurves if fcurve.data_path == data_path),
+        None,
+    )
+
+
+def _find_action_fcurve(action, data_path, array_index=None):
+    if action is None:
+        return None
+    return next(
+        (
+            fcurve
+            for fcurve in action.fcurves
+            if fcurve.data_path == data_path
+            and (array_index is None or fcurve.array_index == array_index)
+        ),
+        None,
+    )
+
+
+def _ensure_action(id_data, name):
+    animation_data = id_data.animation_data_create()
+    if animation_data.action is None:
+        animation_data.action = bpy.data.actions.new(name=name)
+    return animation_data.action
+
+
+def _copy_fcurve_shape(source, destination, value_scale):
+    destination.extrapolation = source.extrapolation
+    destination_points = {
+        round(float(point.co.x), 6): point
+        for point in destination.keyframe_points
+    }
+    for source_point in source.keyframe_points:
+        point = destination_points.get(round(float(source_point.co.x), 6))
+        if point is None:
+            continue
+        point.co.y = source_point.co.y * value_scale
+        point.interpolation = source_point.interpolation
+        point.easing = source_point.easing
+        point.handle_left_type = source_point.handle_left_type
+        point.handle_right_type = source_point.handle_right_type
+        point.handle_left = (
+            source_point.handle_left.x,
+            source_point.handle_left.y * value_scale,
+        )
+        point.handle_right = (
+            source_point.handle_right.x,
+            source_point.handle_right.y * value_scale,
+        )
+        for attribute in ("amplitude", "back", "period"):
+            if hasattr(source_point, attribute) and hasattr(point, attribute):
+                setattr(point, attribute, getattr(source_point, attribute))
+    destination.update()
+
+
+def _animation_signature(key_data, shape_key):
+    fcurve = _value_action_fcurve(key_data, shape_key)
+    if fcurve is None:
+        return ("VALUE", round(float(shape_key.value), 7))
+    return (
+        "KEYS",
+        fcurve.extrapolation,
+        tuple(
+            (
+                round(float(point.co.x), 6),
+                round(float(point.co.y), 7),
+                round(float(point.handle_left.x), 6),
+                round(float(point.handle_left.y), 7),
+                round(float(point.handle_right.x), 6),
+                round(float(point.handle_right.y), 7),
+                point.interpolation,
+            )
+            for point in fcurve.keyframe_points
+        ),
+    )
+
+
+def _validate_shared_animation(shape_keys_by_name):
+    for shape_name, entries in shape_keys_by_name.items():
+        signatures = {
+            _animation_signature(key_data, shape_key)
+            for key_data, shape_key in entries
+        }
+        if len(signatures) > 1:
+            raise RuntimeError(
+                f'Cannot share slider "{shape_name}": selected meshes have '
+                "different values or keyframe animation."
+            )
+
+
+def _move_shape_animation_to_bone(key_data, shape_key, panel, pose_bone):
+    source = _value_action_fcurve(key_data, shape_key)
+    pose_bone.location.x = float(shape_key.value) * SLIDER_TRAVEL
+    if source is None:
+        return
+
+    data_path = pose_bone.path_from_id("location")
+    action = panel.animation_data.action if panel.animation_data else None
+    destination = _find_action_fcurve(action, data_path, 0)
+    if destination is None:
+        for point in source.keyframe_points:
+            pose_bone.location.x = point.co.y * SLIDER_TRAVEL
+            pose_bone.keyframe_insert(
+                data_path="location",
+                index=0,
+                frame=point.co.x,
+                group=pose_bone.name,
+            )
+        action = panel.animation_data.action if panel.animation_data else None
+        destination = _find_action_fcurve(action, data_path, 0)
+        if destination is None:
+            raise RuntimeError(
+                f'Could not create animation for slider "{shape_key.name}".'
+            )
+        _copy_fcurve_shape(source, destination, SLIDER_TRAVEL)
+
+    key_data.animation_data.action.fcurves.remove(source)
+
+
+def _move_bone_animation_to_shape(panel, pose_bone, key_data, shape_key):
+    panel_animation = panel.animation_data
+    panel_action = panel_animation.action if panel_animation is not None else None
+    source = None
+    if panel_action is not None:
+        source = _find_action_fcurve(
+            panel_action, pose_bone.path_from_id("location"), 0
+        )
+
+    shape_key.value = pose_bone.location.x / SLIDER_TRAVEL
+    if source is None:
+        return
+
+    data_path = shape_key.path_from_id("value")
+    action = _ensure_action(key_data, key_data.name + "_Action")
+    old_curve = _find_action_fcurve(action, data_path)
+    if old_curve is not None:
+        action.fcurves.remove(old_curve)
+    for point in source.keyframe_points:
+        shape_key.value = point.co.y / SLIDER_TRAVEL
+        shape_key.keyframe_insert(data_path="value", frame=point.co.x)
+    action = key_data.animation_data.action
+    destination = _find_action_fcurve(action, data_path)
+    if destination is None:
+        raise RuntimeError(
+            f'Could not restore animation for shape key "{shape_key.name}".'
+        )
+    _copy_fcurve_shape(source, destination, 1.0 / SLIDER_TRAVEL)
+
+
 def _update_owned_driver_scale(fcurve, panel, pose_bone):
     for variable in fcurve.driver.variables:
         if variable.type != "TRANSFORMS":
@@ -341,7 +523,7 @@ def _driver_is_owned_by_panel(fcurve, panel, slider_names):
     return False
 
 
-def _remove_panel_and_owned_drivers(panel, target):
+def _remove_panel_and_owned_drivers(panel, targets):
     slider_names = {
         pose_bone.name
         for pose_bone in panel.pose.bones
@@ -349,14 +531,36 @@ def _remove_panel_and_owned_drivers(panel, target):
     }
     removed_drivers = 0
 
-    key_data = None
-    if target is not None and getattr(target, "data", None) is not None:
-        key_data = getattr(target.data, "shape_keys", None)
-    if key_data is not None and key_data.animation_data is not None:
-        for fcurve in list(key_data.animation_data.drivers):
-            if _driver_is_owned_by_panel(fcurve, panel, slider_names):
-                key_data.animation_data.drivers.remove(fcurve)
-                removed_drivers += 1
+    for target in targets:
+        key_data = None
+        if target is not None and getattr(target, "data", None) is not None:
+            key_data = getattr(target.data, "shape_keys", None)
+        if key_data is not None and key_data.animation_data is not None:
+            for fcurve in list(key_data.animation_data.drivers):
+                if _driver_is_owned_by_panel(fcurve, panel, slider_names):
+                    shape_key = next(
+                        (
+                            key
+                            for key in key_data.key_blocks
+                            if key.path_from_id("value") == fcurve.data_path
+                        ),
+                        None,
+                    )
+                    if shape_key is not None:
+                        pose_bone = next(
+                            (
+                                bone
+                                for bone in panel.pose.bones
+                                if bone.get("shape_key_name") == shape_key.name
+                            ),
+                            None,
+                        )
+                    key_data.animation_data.drivers.remove(fcurve)
+                    if shape_key is not None and pose_bone is not None:
+                        _move_bone_animation_to_shape(
+                            panel, pose_bone, key_data, shape_key
+                        )
+                    removed_drivers += 1
 
     widgets = []
     for pose_bone in panel.pose.bones:
@@ -382,8 +586,13 @@ def _remove_panel_and_owned_drivers(panel, target):
         if widget_data is not None and widget_data.users == 0:
             bpy.data.meshes.remove(widget_data)
 
-    if target is not None and target.name in bpy.context.view_layer.objects:
-        _activate_object(target)
+    return_target = next(
+        (target for target in targets if target.name in bpy.context.view_layer.objects),
+        None,
+    )
+    if return_target is not None:
+        _activate_object(return_target)
+    bpy.context.scene.frame_set(bpy.context.scene.frame_current)
 
     message = f"EmjPanel removed: deleted {removed_drivers} owned driver(s)."
     print(message)
@@ -394,39 +603,57 @@ def _remove_panel_and_owned_drivers(panel, target):
     return removed_drivers
 
 
-def _create_panel_for_shape_keys(target, selected_names):
-    shape_keys = _shape_keys_from_object(target)
-    if not shape_keys:
-        raise RuntimeError(f'Object "{target.name}" has no controllable shape keys.')
+def _create_panel_for_shape_keys(targets, selected_pairs):
+    primary_target = targets[0]
+    shape_keys_by_name = {}
+    for target in targets:
+        key_data = target.data.shape_keys
+        for shape_key in _shape_keys_from_object(target):
+            if (
+                (target.name, shape_key.name) in selected_pairs
+                and _value_driver(key_data, shape_key) is None
+            ):
+                shape_keys_by_name.setdefault(shape_key.name, []).append(
+                    (key_data, shape_key)
+                )
 
-    key_data = target.data.shape_keys
-    # Preserve drivers not created by EmjPanel.
-    available_shape_keys = [
-        shape_key
-        for shape_key in shape_keys
-        if shape_key.name in selected_names
-        and _value_driver(key_data, shape_key) is None
-    ]
-    if not available_shape_keys:
+    if not shape_keys_by_name:
         raise RuntimeError("No eligible shape keys were selected.")
 
-    panel = _create_panel_armature(target)
-    _rename_panel(panel, target)
+    _validate_shared_animation(shape_keys_by_name)
+
+    # One representative key per name creates one shared slider bone.
+    available_shape_keys = [entries[0][1] for entries in shape_keys_by_name.values()]
+    panel = _create_panel_armature(primary_target, targets)
+    _rename_panel(panel, primary_target, targets)
     bone_by_shape, master_bone, renamed_bones = _build_bones_and_frame(
-        panel, target, available_shape_keys
+        panel, primary_target, available_shape_keys
     )
-    _retarget_renamed_slider_drivers(key_data, panel, renamed_bones)
+    for target in targets:
+        _retarget_renamed_slider_drivers(
+            target.data.shape_keys, panel, renamed_bones
+        )
 
     added = 0
-    for shape_key in available_shape_keys:
-        _add_driver(shape_key, panel, bone_by_shape[shape_key.name])
-        added += 1
+    for shape_name, entries in shape_keys_by_name.items():
+        pose_bone = bone_by_shape[shape_name]
+        for key_data, shape_key in entries:
+            _move_shape_animation_to_bone(
+                key_data, shape_key, panel, pose_bone
+            )
+            _add_driver(shape_key, panel, pose_bone)
+            added += 1
+
+    # Force Blender to evaluate the newly created bone action at the current
+    # frame instead of leaving the slider at the value of the last copied key.
+    bpy.context.scene.frame_set(bpy.context.scene.frame_current)
 
     _activate_object(panel)
     bpy.ops.object.mode_set(mode="POSE")
 
     message = (
-        f"Shape-key panel ready: added {added} selected driver(s)."
+        f"Shape-key panel ready: {len(shape_keys_by_name)} slider(s), "
+        f"{added} driver(s) across {len(targets)} mesh object(s)."
     )
     print(message)
     try:
@@ -438,6 +665,9 @@ def _create_panel_for_shape_keys(target, selected_names):
 
 class EMJ_PG_shape_key_choice(PropertyGroup):
     name: StringProperty()
+    target_name: StringProperty()
+    shape_key_name: StringProperty()
+
     def _keep_external_driver_unselected(self, context):
         if self.has_driver and self.selected:
             self.selected = False
@@ -466,6 +696,7 @@ class EMJ_OT_choose_shape_keys(Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     target_name: StringProperty(options={"HIDDEN"})
+    target_names_json: StringProperty(options={"HIDDEN"})
 
     def invoke(self, context, event):
         active = context.active_object
@@ -473,26 +704,42 @@ class EMJ_OT_choose_shape_keys(Operator):
             self.report({"ERROR"}, "Select a mesh with shape keys first.")
             return {"CANCELLED"}
 
-        if active.type == "ARMATURE" and active.get("shape_key_slider_target"):
+        if active.type == "ARMATURE" and _panel_target_names(active):
             panel = active
-            target = _target_from_panel(panel)
+            targets = _targets_from_panel(panel)
+            target = targets[0] if targets else None
         else:
             target = active
+            targets = [
+                obj
+                for obj in context.selected_objects
+                if obj.type == "MESH" and _shape_keys_from_object(obj)
+            ]
+            if target in targets:
+                targets.remove(target)
+                targets.insert(0, target)
             panel = _find_panel_armature(target)
+            if panel is not None:
+                # Editing any member of an existing shared panel keeps its
+                # other targets, while newly selected meshes are added.
+                known_targets = _targets_from_panel(panel)
+                for known_target in known_targets:
+                    if known_target not in targets:
+                        targets.append(known_target)
 
         if target is None:
             self.report({"ERROR"}, "The EmjPanel source object no longer exists.")
             return {"CANCELLED"}
 
-        shape_keys = _shape_keys_from_object(target)
-        if not shape_keys:
+        if target.type != "MESH" or not targets:
             self.report({"ERROR"}, "The active object has no shape keys.")
             return {"CANCELLED"}
 
         self.target_name = target.name
+        self.target_names_json = json.dumps([obj.name for obj in targets])
         choices = context.window_manager.emj_shape_key_choices
         choices.clear()
-        active_key = target.active_shape_key
+        active_key_name = target.active_shape_key.name if target.active_shape_key else None
         eligible_count = 0
         slider_names = {
             pose_bone.name
@@ -500,21 +747,29 @@ class EMJ_OT_choose_shape_keys(Operator):
             if pose_bone.get("shape_key_name")
         } if panel is not None else set()
 
-        for shape_key in shape_keys:
-            item = choices.add()
-            item.name = shape_key.name
-            existing_driver = _value_driver(target.data.shape_keys, shape_key)
-            owned_driver = (
-                existing_driver is not None
-                and panel is not None
-                and _driver_is_owned_by_panel(existing_driver, panel, slider_names)
-            )
-            item.has_driver = existing_driver is not None and not owned_driver
-            item.selected = owned_driver or (
-                panel is None and shape_key == active_key and not item.has_driver
-            )
-            if not item.has_driver:
-                eligible_count += 1
+        for obj in targets:
+            for shape_key in _shape_keys_from_object(obj):
+                item = choices.add()
+                item.name = f"{obj.name}\x1f{shape_key.name}"
+                item.target_name = obj.name
+                item.shape_key_name = shape_key.name
+                existing_driver = _value_driver(obj.data.shape_keys, shape_key)
+                owned_driver = (
+                    existing_driver is not None
+                    and panel is not None
+                    and _driver_is_owned_by_panel(
+                        existing_driver, panel, slider_names
+                    )
+                )
+                item.has_driver = existing_driver is not None and not owned_driver
+                item.selected = owned_driver or (
+                    panel is None
+                    and obj == target
+                    and shape_key.name == active_key_name
+                    and not item.has_driver
+                )
+                if not item.has_driver:
+                    eligible_count += 1
 
         if eligible_count == 0:
             self.report({"INFO"}, "All shape keys already have drivers.")
@@ -523,7 +778,7 @@ class EMJ_OT_choose_shape_keys(Operator):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Select the shape keys to control:")
+        layout.label(text="Select shared shape-key sliders by mesh:")
         button_row = layout.row(align=True)
         select_all = button_row.operator(
             "object.emj_set_all_shape_key_choices",
@@ -538,36 +793,66 @@ class EMJ_OT_choose_shape_keys(Operator):
             icon="CHECKBOX_DEHLT",
         )
         select_none.selected = False
-        column = layout.column(align=True)
-        for item in context.window_manager.emj_shape_key_choices:
-            row = column.row(align=True)
-            row.enabled = not item.has_driver
-            row.prop(item, "selected", text=item.name, toggle=True)
-            if item.has_driver:
-                row.label(text="Existing driver", icon="DRIVER")
+
+        try:
+            target_names = json.loads(self.target_names_json)
+        except (TypeError, ValueError):
+            target_names = [self.target_name]
+
+        choices = context.window_manager.emj_shape_key_choices
+        for target_name in target_names:
+            target = bpy.data.objects.get(target_name)
+            if target is None:
+                continue
+
+            group = layout.box()
+            group.label(text=target.name, icon="MESH_DATA")
+            column = group.column(align=True)
+            for shape_key in _shape_keys_from_object(target):
+                item = choices.get(f"{target.name}\x1f{shape_key.name}")
+                if item is None:
+                    continue
+                row = column.row(align=True)
+                row.enabled = not item.has_driver
+                row.prop(item, "selected", text=shape_key.name, toggle=True)
+                if item.has_driver:
+                    row.label(text="Existing driver", icon="DRIVER")
 
     def execute(self, context):
-        target = bpy.data.objects.get(self.target_name)
-        if target is None:
+        try:
+            target_names = json.loads(self.target_names_json)
+        except (TypeError, ValueError):
+            target_names = [self.target_name]
+        targets = [
+            target
+            for name in target_names
+            if (target := bpy.data.objects.get(name)) is not None
+        ]
+        if not targets:
             self.report({"ERROR"}, "The source object no longer exists.")
             return {"CANCELLED"}
 
-        selected_names = {
-            item.name
+        selected_pairs = {
+            (item.target_name, item.shape_key_name)
             for item in context.window_manager.emj_shape_key_choices
             if item.selected and not item.has_driver
         }
         try:
-            existing_panel = _find_panel_armature(target)
-            if existing_panel is not None:
-                _remove_panel_and_owned_drivers(existing_panel, target)
-            if selected_names:
-                _create_panel_for_shape_keys(target, selected_names)
+            existing_panels = {
+                panel
+                for target in targets
+                if (panel := _find_panel_armature(target)) is not None
+            }
+            for existing_panel in existing_panels:
+                old_targets = _targets_from_panel(existing_panel)
+                _remove_panel_and_owned_drivers(existing_panel, old_targets)
+            if selected_pairs:
+                _create_panel_for_shape_keys(targets, selected_pairs)
         except RuntimeError as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
 
-        if not selected_names:
+        if not selected_pairs:
             self.report({"INFO"}, "EmjPanel controls removed.")
         return {"FINISHED"}
 
@@ -609,3 +894,4 @@ def build_shape_key_slider_panel():
 if __name__ == "__main__":
     register()
     build_shape_key_slider_panel()
+
