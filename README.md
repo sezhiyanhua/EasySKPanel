@@ -24,6 +24,8 @@ Tested and confirmed working with Blender 3.6 and Blender 5.2.
 
 Run the script again with the source mesh or its generated EmjPanel selected to update or remove the controls.
 
+![Usage](step1.gif)
+
 ## Notes
 
 - Existing drivers not created by EasySKPanel are preserved.
